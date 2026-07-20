@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::{
     coroutine::*,
-    rfc5321::SmtpResponse,
+    rfc5321::{SmtpReplyCode, SmtpResponse},
     utils::{escape_byte_string, parsers::format_rich_errors},
 };
 
@@ -111,8 +111,28 @@ impl<Cmd> SmtpCoroutine for SmtpCommandSend<Cmd> {
                     }
                 },
                 State::Parse => {
-                    return match SmtpResponse::parse(&self.buf) {
+                    let response_len = SmtpResponse::first_complete_len(&self.buf)
+                        .expect("complete SMTP response has a final line");
+                    let (response_bytes, trailing) = self.buf.split_at(response_len);
+
+                    return match SmtpResponse::parse(response_bytes) {
                         Ok(response) => {
+                            let rejected_then_shutdown = !trailing.is_empty()
+                                && response.is_error()
+                                && is_shutdown_response(trailing);
+
+                            if !trailing.is_empty() && !rejected_then_shutdown {
+                                let reason = SmtpResponse::parse(&self.buf)
+                                    .map(|_| String::from("unexpected trailing SMTP response"))
+                                    .unwrap_or_else(format_rich_errors);
+                                let err = SmtpCommandSendError::ParseResponse(reason);
+                                return SmtpCoroutineState::Complete(Err(err));
+                            }
+
+                            if rejected_then_shutdown {
+                                debug!("server closed connection after rejecting command");
+                            }
+
                             let response = response.into_static();
                             let _ = mem::take(&mut self.buf);
                             debug!("response parsed");
@@ -129,4 +149,11 @@ impl<Cmd> SmtpCoroutine for SmtpCommandSend<Cmd> {
             }
         }
     }
+}
+
+fn is_shutdown_response(buf: &[u8]) -> bool {
+    matches!(
+        SmtpResponse::parse(buf),
+        Ok(response) if response.code == SmtpReplyCode::SERVICE_NOT_AVAILABLE
+    )
 }

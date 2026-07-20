@@ -20,6 +20,28 @@ pub struct SmtpResponse<'a> {
 }
 
 impl SmtpResponse<'_> {
+    /// Returns the byte length of the first complete SMTP response in `buf`.
+    pub(crate) fn first_complete_len(buf: &[u8]) -> Option<usize> {
+        let mut line_start = 0;
+
+        while let Some(relative_end) = buf[line_start..]
+            .windows(2)
+            .position(|pair| pair == b"\r\n")
+        {
+            let line_end = line_start + relative_end;
+            let response_end = line_end + 2;
+            let line = &buf[line_start..line_end];
+
+            if line.get(3) == Some(&b' ') {
+                return Some(response_end);
+            }
+
+            line_start = response_end;
+        }
+
+        None
+    }
+
     /// Returns true if `buf` contains a complete SMTP response.
     ///
     /// A response is complete when the last CRLF-terminated line has

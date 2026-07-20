@@ -187,6 +187,24 @@ mod tests {
     }
 
     #[test]
+    fn rejection_followed_by_shutdown_returns_rejection() {
+        let mut mail = SmtpMail::new(null_path(), Vec::new());
+        let _ = expect_wants_write(&mut mail, None);
+        expect_wants_read(&mut mail);
+
+        let err = expect_complete_err(
+            &mut mail,
+            b"501 5.1.7 Bad sender address syntax\r\n\
+              421 4.7.0 mta1.migadu.com Error: too many errors\r\n",
+        );
+        let SmtpMailError::Rejected { code, message } = err else {
+            panic!("expected SmtpMailError::Rejected, got {err:?}");
+        };
+        assert_eq!(code, 501);
+        assert_eq!(message, "5.1.7 Bad sender address syntax");
+    }
+
+    #[test]
     fn eof_returns_eof_error() {
         let mut mail = SmtpMail::new(null_path(), Vec::new());
         let _ = expect_wants_write(&mut mail, None);
