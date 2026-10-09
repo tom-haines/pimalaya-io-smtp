@@ -18,3 +18,12 @@ status: current
 - GIVEN a message carrying `Bcc: c@x` and default options
 - WHEN it is sent
 - THEN the `DATA` payload carries no `Bcc` field, and a `Bcc:` line in the body is left alone
+
+## Requirement: Envelope parameters
+
+`SmtpMessageSendOptions::mail_parameters` SHALL be sent on `MAIL FROM` and `SmtpMessageSendOptions::rcpt_parameters` on every `RCPT TO`, in the given order (RFC 5321 4.1.1.2, 4.1.1.3). Both default to empty. The composite does not check the server announced the matching extension: the caller holds the EHLO capabilities and decides. A caller needing different parameters per recipient drives the single steps instead.
+
+### Scenario: A delivery status notification request
+- GIVEN `RET=HDRS` and `ENVID=abc123` as MAIL parameters and `NOTIFY=SUCCESS,FAILURE` as RCPT parameters
+- WHEN the message is sent
+- THEN the server reads `MAIL FROM:<a@x> RET=HDRS ENVID=abc123` and `RCPT TO:<c@x> NOTIFY=SUCCESS,FAILURE`

@@ -69,7 +69,7 @@ use thiserror::Error;
 use crate::{
     coroutine::*,
     rfc5321::{
-        SmtpForwardPath, SmtpReversePath,
+        SmtpForwardPath, SmtpParameter, SmtpReversePath,
         data::{SmtpData, SmtpDataError},
         mail::{SmtpMail, SmtpMailError},
         rcpt::{SmtpRcpt, SmtpRcptError},
@@ -96,6 +96,12 @@ pub enum SmtpMessageSendError {
 pub struct SmtpMessageSendOptions {
     /// Transmit the `Bcc` field instead of removing it (RFC 5322 3.6.3).
     pub keep_bcc: bool,
+    /// ESMTP parameters of the MAIL FROM command (RFC 5321 4.1.1.2), such
+    /// as the DSN `RET` and `ENVID` (RFC 3461 4.3, 4.4).
+    pub mail_parameters: Vec<SmtpParameter<'static>>,
+    /// ESMTP parameters of every RCPT TO command (RFC 5321 4.1.1.3), such
+    /// as the DSN `NOTIFY` (RFC 3461 4.1).
+    pub rcpt_parameters: Vec<SmtpParameter<'static>>,
 }
 
 /// I/O-free SMTP composite send coroutine.
@@ -106,6 +112,7 @@ pub struct SmtpMessageSendOptions {
 pub struct SmtpMessageSend {
     state: State,
     forward_paths: VecDeque<SmtpForwardPath<'static>>,
+    rcpt_parameters: Vec<SmtpParameter<'static>>,
     message: Option<Vec<u8>>,
 }
 
@@ -124,8 +131,12 @@ impl SmtpMessageSend {
             .collect();
 
         Self {
-            state: State::MailFrom(SmtpMail::new(reverse_path.into_static(), Vec::new())),
+            state: State::MailFrom(SmtpMail::new(
+                reverse_path.into_static(),
+                options.mail_parameters,
+            )),
             forward_paths,
+            rcpt_parameters: options.rcpt_parameters,
             message: Some(match options.keep_bcc {
                 true => message,
                 false => strip_bcc(&message),
@@ -164,7 +175,7 @@ impl SmtpCoroutine for SmtpMessageSend {
 impl SmtpMessageSend {
     fn next_rcpt_or_data(&mut self) -> State {
         match self.forward_paths.pop_front() {
-            Some(path) => State::RcptTo(SmtpRcpt::new(path, Vec::new())),
+            Some(path) => State::RcptTo(SmtpRcpt::new(path, self.rcpt_parameters.clone())),
             None => {
                 let body = self.message.take().expect("message taken twice");
                 State::Data(SmtpData::new(body))
@@ -225,11 +236,12 @@ fn is_bcc(line: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use alloc::vec::Vec;
+    use alloc::{vec, vec::Vec};
 
     use crate::{
         coroutine::*,
         message::*,
+        rfc3461::parameter::{SmtpDsnNotify, SmtpDsnRet},
         rfc5321::{SmtpDomain, SmtpEhloDomain, SmtpLocalPart, SmtpMailbox},
     };
 
@@ -266,13 +278,35 @@ mod tests {
         let raw = b"From: a@x\r\nBcc: c@x\r\n\r\nbody\r\n";
 
         let removed = transmitted(raw, SmtpMessageSendOptions::default());
-        assert!(!removed.windows(4).any(|w| w == b"Bcc:"));
+        assert!(!removed[3].windows(4).any(|w| w == b"Bcc:"));
 
-        let kept = transmitted(raw, SmtpMessageSendOptions { keep_bcc: true });
-        assert!(kept.windows(4).any(|w| w == b"Bcc:"));
+        let options = SmtpMessageSendOptions {
+            keep_bcc: true,
+            ..Default::default()
+        };
+        let kept = transmitted(raw, options);
+        assert!(kept[3].windows(4).any(|w| w == b"Bcc:"));
     }
 
-    fn transmitted(raw: &[u8], options: SmtpMessageSendOptions) -> Vec<u8> {
+    #[test]
+    fn sends_the_parameters_on_mail_from_and_rcpt_to() {
+        let notify = SmtpDsnNotify::SUCCESS | SmtpDsnNotify::FAILURE;
+        let options = SmtpMessageSendOptions {
+            mail_parameters: vec![
+                SmtpDsnRet::Hdrs.into_parameter(),
+                SmtpParameter::envid("abc123"),
+            ],
+            rcpt_parameters: vec![notify.into_parameter()],
+            ..Default::default()
+        };
+
+        let written = transmitted(b"\r\nbody\r\n", options);
+        assert_eq!(written[0], b"MAIL FROM:<a@x> RET=HDRS ENVID=abc123\r\n");
+        assert_eq!(written[1], b"RCPT TO:<c@x> NOTIFY=SUCCESS,FAILURE\r\n");
+    }
+
+    /// Runs the send against canned replies, returning every write.
+    fn transmitted(raw: &[u8], options: SmtpMessageSendOptions) -> Vec<Vec<u8>> {
         let mailbox = |local: &'static str| SmtpMailbox {
             local_part: SmtpLocalPart(local.into()),
             domain: SmtpEhloDomain::SmtpDomain(SmtpDomain("x".into())),
@@ -292,7 +326,7 @@ mod tests {
 
         loop {
             match send.resume(arg.take()) {
-                SmtpCoroutineState::Yielded(SmtpYield::WantsWrite(bytes)) => written = bytes,
+                SmtpCoroutineState::Yielded(SmtpYield::WantsWrite(bytes)) => written.push(bytes),
                 SmtpCoroutineState::Yielded(SmtpYield::WantsRead) => arg = replies.next(),
                 SmtpCoroutineState::Complete(result) => break result.unwrap(),
             }

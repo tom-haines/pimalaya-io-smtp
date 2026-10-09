@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `mail_parameters` and `rcpt_parameters` to `SmtpMessageSendOptions`, the ESMTP parameters of MAIL FROM and of every RCPT TO, such as the DSN ones (RFC 3461).
+
+### Changed
+
+- **BREAKING**: `SmtpMessageSendOptions` gained two fields, so a struct literal needs `..Default::default()`.
+
 ## [0.5.0] - 2026-09-29
 
 ### Added
