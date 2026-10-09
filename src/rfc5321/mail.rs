@@ -205,6 +205,59 @@ mod tests {
     }
 
     #[test]
+    fn rejection_followed_by_split_shutdown_returns_rejection() {
+        let mut mail = SmtpMail::new(null_path(), Vec::new());
+        let _ = expect_wants_write(&mut mail, None);
+        expect_wants_read(&mut mail);
+
+        expect_wants_more(
+            &mut mail,
+            b"501 5.1.7 Bad sender address syntax\r\n421 4.7.0 mta1",
+        );
+        let err = expect_complete_err(&mut mail, b".migadu.com Error: too many errors\r\n");
+        let SmtpMailError::Rejected { code, message } = err else {
+            panic!("expected SmtpMailError::Rejected, got {err:?}");
+        };
+        assert_eq!(code, 501);
+        assert_eq!(message, "5.1.7 Bad sender address syntax");
+    }
+
+    #[test]
+    fn rejection_followed_by_shutdown_cut_short_returns_rejection() {
+        let mut mail = SmtpMail::new(null_path(), Vec::new());
+        let _ = expect_wants_write(&mut mail, None);
+        expect_wants_read(&mut mail);
+
+        expect_wants_more(
+            &mut mail,
+            b"501 5.1.7 Bad sender address syntax\r\n421 4.7.0 mta1",
+        );
+        let err = expect_complete_err(&mut mail, b"");
+        let SmtpMailError::Rejected { code, message } = err else {
+            panic!("expected SmtpMailError::Rejected, got {err:?}");
+        };
+        assert_eq!(code, 501);
+        assert_eq!(message, "5.1.7 Bad sender address syntax");
+    }
+
+    #[test]
+    fn rejection_followed_by_other_bytes_returns_parse_error() {
+        let mut mail = SmtpMail::new(null_path(), Vec::new());
+        let _ = expect_wants_write(&mut mail, None);
+        expect_wants_read(&mut mail);
+
+        expect_wants_more(
+            &mut mail,
+            b"501 5.1.7 Bad sender address syntax\r\n250 2.1.0",
+        );
+        let err = expect_complete_err(&mut mail, b"");
+        assert!(matches!(
+            err,
+            SmtpMailError::Send(SmtpCommandSendError::ParseResponse(_))
+        ));
+    }
+
+    #[test]
     fn eof_returns_eof_error() {
         let mut mail = SmtpMail::new(null_path(), Vec::new());
         let _ = expect_wants_write(&mut mail, None);
@@ -226,6 +279,13 @@ mod tests {
 
     fn expect_wants_read(cor: &mut SmtpMail) {
         match cor.resume(None) {
+            SmtpCoroutineState::Yielded(SmtpYield::WantsRead) => {}
+            state => panic!("expected WantsRead, got {state:?}"),
+        }
+    }
+
+    fn expect_wants_more(cor: &mut SmtpMail, partial: &[u8]) {
+        match cor.resume(Some(partial)) {
             SmtpCoroutineState::Yielded(SmtpYield::WantsRead) => {}
             state => panic!("expected WantsRead, got {state:?}"),
         }

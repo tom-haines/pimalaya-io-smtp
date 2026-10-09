@@ -1,10 +1,17 @@
 //! Base coroutine that every higher-level SMTP coroutine delegates
 //! to: serialises a command, runs the read/write exchange, and feeds
 //! the reply through [`SmtpResponse::is_complete`] / [`SmtpResponse::parse`].
+//!
+//! A server giving up on the session answers the offending command
+//! with an error reply, then sends a 421 and closes (RFC 5321
+//! section 4.2.1). Both replies may land in one read, and the close
+//! may cut the 421 short, so the parse step takes the first reply
+//! only, drops a 421 found behind an error reply, and refuses any
+//! other trailing bytes.
 
 use core::{fmt, marker::PhantomData, mem};
 
-use alloc::{string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
 
 use bounded_static::IntoBoundedStatic;
 use log::{debug, trace};
@@ -36,7 +43,11 @@ pub struct SmtpCommandSendOk {
 enum State {
     Write,
     Read,
-    Parse,
+    /// `closed` records that the stream reached EOF behind the
+    /// complete reply, so the bytes trailing it may be cut short.
+    Parse {
+        closed: bool,
+    },
 }
 
 impl fmt::Display for State {
@@ -44,7 +55,7 @@ impl fmt::Display for State {
         match self {
             Self::Write => f.write_str("write command"),
             Self::Read => f.write_str("read response"),
-            Self::Parse => f.write_str("parse response"),
+            Self::Parse { .. } => f.write_str("parse response"),
         }
     }
 }
@@ -92,7 +103,12 @@ impl<Cmd> SmtpCoroutine for SmtpCommandSend<Cmd> {
                 }
                 State::Read => match arg.take() {
                     Some(&[]) => {
-                        return SmtpCoroutineState::Complete(Err(SmtpCommandSendError::Eof));
+                        if SmtpResponse::first_complete_len(&self.buf).is_none() {
+                            return SmtpCoroutineState::Complete(Err(SmtpCommandSendError::Eof));
+                        }
+
+                        self.state = State::Parse { closed: true };
+                        debug!("stream closed behind a complete response, parsing");
                     }
                     Some(data) => {
                         trace!("read bytes: {}", escape_byte_string(data));
@@ -103,34 +119,32 @@ impl<Cmd> SmtpCoroutine for SmtpCommandSend<Cmd> {
                             continue;
                         }
 
-                        self.state = State::Parse;
+                        self.state = State::Parse { closed: false };
                         debug!("response complete, parsing");
                     }
                     None => {
                         self.wants_read = true;
                     }
                 },
-                State::Parse => {
+                State::Parse { closed } => {
+                    let closed = *closed;
                     let response_len = SmtpResponse::first_complete_len(&self.buf)
                         .expect("complete SMTP response has a final line");
                     let (response_bytes, trailing) = self.buf.split_at(response_len);
 
                     return match SmtpResponse::parse(response_bytes) {
                         Ok(response) => {
-                            let rejected_then_shutdown = !trailing.is_empty()
-                                && response.is_error()
-                                && is_shutdown_response(trailing);
+                            if !trailing.is_empty() {
+                                if !(response.is_error() && is_shutdown_reply(trailing, closed)) {
+                                    let reason = format!(
+                                        "unexpected bytes after the reply: {}",
+                                        escape_byte_string(trailing)
+                                    );
+                                    let err = SmtpCommandSendError::ParseResponse(reason);
+                                    return SmtpCoroutineState::Complete(Err(err));
+                                }
 
-                            if !trailing.is_empty() && !rejected_then_shutdown {
-                                let reason = SmtpResponse::parse(&self.buf)
-                                    .map(|_| String::from("unexpected trailing SMTP response"))
-                                    .unwrap_or_else(format_rich_errors);
-                                let err = SmtpCommandSendError::ParseResponse(reason);
-                                return SmtpCoroutineState::Complete(Err(err));
-                            }
-
-                            if rejected_then_shutdown {
-                                debug!("server closed connection after rejecting command");
+                                debug!("421 behind the error reply dropped, server is closing");
                             }
 
                             let response = response.into_static();
@@ -151,7 +165,15 @@ impl<Cmd> SmtpCoroutine for SmtpCommandSend<Cmd> {
     }
 }
 
-fn is_shutdown_response(buf: &[u8]) -> bool {
+/// Whether `buf` is a 421 reply (RFC 5321 section 4.2.1), the one
+/// reply a server sends before closing on its own. With `closed` the
+/// stream ended behind `buf`, which may then hold only its start.
+fn is_shutdown_reply(buf: &[u8], closed: bool) -> bool {
+    if closed {
+        let seen = buf.len().min(3);
+        return buf[..seen] == b"421"[..seen];
+    }
+
     matches!(
         SmtpResponse::parse(buf),
         Ok(response) if response.code == SmtpReplyCode::SERVICE_NOT_AVAILABLE
